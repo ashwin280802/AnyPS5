@@ -3378,7 +3378,8 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         const auto resident = metadataPassResident(context, color);
         if (resident != nullptr) {
             const char* refusal = nullptr;
-            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal, true) : StorageTexture::FindPending(color.address, color.bytes) == resident || resident->UploadedKeys() == keys;
+            const bool pending = StorageTexture::FindPending(color.address, color.bytes) == resident;
+            const bool current = pending || (keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal, true) : resident->UploadedKeys() == keys);
             if (current) {
                 resident->MarkDirty();
                 MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
