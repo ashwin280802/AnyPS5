@@ -196,6 +196,117 @@ int main() {
         return b.Folds(bothLow, false) && b.Keeps(bothFits) && b.Folds(boundedHigh, false) && b.Keeps(boundedFits);
     });
 
+    passed &= run("unsigned minimum and maximum fold boundary and idempotent identities", [] {
+        Builder b;
+        auto& value = b.Unknown();
+        auto& minimumZero = b.Binary(IrOpcode::UMin32, value, 0u);
+        auto& maximumZero = b.Binary(IrOpcode::UMax32, value, 0u);
+        auto& minimumMaximum = b.Binary(IrOpcode::UMin32, value, 0xffffffffu);
+        auto& maximumMaximum = b.Binary(IrOpcode::UMax32, value, 0xffffffffu);
+        auto& minimumZeroReversed = b.Binary(IrOpcode::UMin32, b.Constant(0u), value);
+        auto& maximumZeroReversed = b.Binary(IrOpcode::UMax32, b.Constant(0u), value);
+        auto& minimumMaximumReversed = b.Binary(IrOpcode::UMin32, b.Constant(0xffffffffu), value);
+        auto& maximumMaximumReversed = b.Binary(IrOpcode::UMax32, b.Constant(0xffffffffu), value);
+        auto& minimumSame = b.Binary(IrOpcode::UMin32, value, value);
+        auto& maximumSame = b.Binary(IrOpcode::UMax32, value, value);
+        const auto retain = [&](IrValue& result) -> IrValue& { return b.Emit(IrOpcode::Reference, IrType::Void, {&result}); };
+        auto& minimumZeroReference = retain(minimumZero);
+        auto& maximumZeroReference = retain(maximumZero);
+        auto& minimumMaximumReference = retain(minimumMaximum);
+        auto& maximumMaximumReference = retain(maximumMaximum);
+        auto& minimumZeroReversedReference = retain(minimumZeroReversed);
+        auto& maximumZeroReversedReference = retain(maximumZeroReversed);
+        auto& minimumMaximumReversedReference = retain(minimumMaximumReversed);
+        auto& maximumMaximumReversedReference = retain(maximumMaximumReversed);
+        auto& minimumSameReference = retain(minimumSame);
+        auto& maximumSameReference = retain(maximumSame);
+        b.Fold();
+        const auto forwards = [](const IrValue& reference, const IrValue& expected) {
+            return reference.Argument(0)->Resolve() == expected.Resolve();
+        };
+        const auto isConstant = [](const IrValue& reference, std::uint32_t expected) {
+            const IrValue* result = reference.Argument(0)->Resolve();
+            return result->Type() == IrType::U32 && result->HasImmediate() && result->ImmediateU32() == expected;
+        };
+        const bool lowerBoundary = isConstant(minimumZeroReference, 0u) && forwards(maximumZeroReference, value) && isConstant(minimumZeroReversedReference, 0u) && forwards(maximumZeroReversedReference, value);
+        const bool upperBoundary = forwards(minimumMaximumReference, value) && isConstant(maximumMaximumReference, 0xffffffffu) && forwards(minimumMaximumReversedReference, value) && isConstant(maximumMaximumReversedReference, 0xffffffffu);
+        return lowerBoundary && upperBoundary && forwards(minimumSameReference, value) && forwards(maximumSameReference, value);
+    });
+
+    passed &= run("signed minimum and maximum fold boundary and idempotent identities", [] {
+        Builder b;
+        auto& value = b.Unknown();
+        auto& minimumMin = b.Binary(IrOpcode::SMin32, value, 0x80000000u);
+        auto& maximumMin = b.Binary(IrOpcode::SMax32, value, 0x80000000u);
+        auto& minimumMax = b.Binary(IrOpcode::SMin32, value, 0x7fffffffu);
+        auto& maximumMax = b.Binary(IrOpcode::SMax32, value, 0x7fffffffu);
+        auto& minimumMinReversed = b.Binary(IrOpcode::SMin32, b.Constant(0x80000000u), value);
+        auto& maximumMinReversed = b.Binary(IrOpcode::SMax32, b.Constant(0x80000000u), value);
+        auto& minimumMaxReversed = b.Binary(IrOpcode::SMin32, b.Constant(0x7fffffffu), value);
+        auto& maximumMaxReversed = b.Binary(IrOpcode::SMax32, b.Constant(0x7fffffffu), value);
+        auto& minimumSame = b.Binary(IrOpcode::SMin32, value, value);
+        auto& maximumSame = b.Binary(IrOpcode::SMax32, value, value);
+        const auto retain = [&](IrValue& result) -> IrValue& { return b.Emit(IrOpcode::Reference, IrType::Void, {&result}); };
+        auto& minimumMinReference = retain(minimumMin);
+        auto& maximumMinReference = retain(maximumMin);
+        auto& minimumMaxReference = retain(minimumMax);
+        auto& maximumMaxReference = retain(maximumMax);
+        auto& minimumMinReversedReference = retain(minimumMinReversed);
+        auto& maximumMinReversedReference = retain(maximumMinReversed);
+        auto& minimumMaxReversedReference = retain(minimumMaxReversed);
+        auto& maximumMaxReversedReference = retain(maximumMaxReversed);
+        auto& minimumSameReference = retain(minimumSame);
+        auto& maximumSameReference = retain(maximumSame);
+        b.Fold();
+        const auto forwards = [](const IrValue& reference, const IrValue& expected) {
+            return reference.Argument(0)->Resolve() == expected.Resolve();
+        };
+        const auto isConstant = [](const IrValue& reference, std::uint32_t expected) {
+            const IrValue* result = reference.Argument(0)->Resolve();
+            return result->Type() == IrType::U32 && result->HasImmediate() && result->ImmediateU32() == expected;
+        };
+        const bool lowerBoundary = isConstant(minimumMinReference, 0x80000000u) && forwards(maximumMinReference, value) && isConstant(minimumMinReversedReference, 0x80000000u) && forwards(maximumMinReversedReference, value);
+        const bool upperBoundary = forwards(minimumMaxReference, value) && isConstant(maximumMaxReference, 0x7fffffffu) && forwards(minimumMaxReversedReference, value) && isConstant(maximumMaxReversedReference, 0x7fffffffu);
+        return lowerBoundary && upperBoundary && forwards(minimumSameReference, value) && forwards(maximumSameReference, value);
+    });
+
+    passed &= run("integer algebraic self-identities, idempotence, and annihilators fold", [] {
+        Builder b;
+        auto& value = b.Unknown();
+        auto& subSame = b.Binary(IrOpcode::ISub32, value, value);
+        auto& xorSame = b.Binary(IrOpcode::BitwiseXor32, value, value);
+        auto& andSame = b.Binary(IrOpcode::BitwiseAnd32, value, value);
+        auto& orSame = b.Binary(IrOpcode::BitwiseOr32, value, value);
+        auto& mulZero = b.Binary(IrOpcode::IMul32, value, 0u);
+        auto& mulZeroReversed = b.Binary(IrOpcode::IMul32, b.Constant(0u), value);
+        auto& andZero = b.Binary(IrOpcode::BitwiseAnd32, value, 0u);
+        auto& andZeroReversed = b.Binary(IrOpcode::BitwiseAnd32, b.Constant(0u), value);
+        auto& orAllOnes = b.Binary(IrOpcode::BitwiseOr32, value, 0xffffffffu);
+        auto& orAllOnesReversed = b.Binary(IrOpcode::BitwiseOr32, b.Constant(0xffffffffu), value);
+        const auto retain = [&](IrValue& result) -> IrValue& { return b.Emit(IrOpcode::Reference, IrType::Void, {&result}); };
+        auto& subSameRef = retain(subSame);
+        auto& xorSameRef = retain(xorSame);
+        auto& andSameRef = retain(andSame);
+        auto& orSameRef = retain(orSame);
+        auto& mulZeroRef = retain(mulZero);
+        auto& mulZeroRevRef = retain(mulZeroReversed);
+        auto& andZeroRef = retain(andZero);
+        auto& andZeroRevRef = retain(andZeroReversed);
+        auto& orAllOnesRef = retain(orAllOnes);
+        auto& orAllOnesRevRef = retain(orAllOnesReversed);
+        b.Fold();
+        const auto forwards = [](const IrValue& reference, const IrValue& expected) {
+            return reference.Argument(0)->Resolve() == expected.Resolve();
+        };
+        const auto isConstant = [](const IrValue& reference, std::uint32_t expected) {
+            const IrValue* result = reference.Argument(0)->Resolve();
+            return result->Type() == IrType::U32 && result->HasImmediate() && result->ImmediateU32() == expected;
+        };
+        const bool selfOps = isConstant(subSameRef, 0u) && isConstant(xorSameRef, 0u) && forwards(andSameRef, value) && forwards(orSameRef, value);
+        const bool annihilators = isConstant(mulZeroRef, 0u) && isConstant(mulZeroRevRef, 0u) && isConstant(andZeroRef, 0u) && isConstant(andZeroRevRef, 0u) && isConstant(orAllOnesRef, 0xffffffffu) && isConstant(orAllOnesRevRef, 0xffffffffu);
+        return selfOps && annihilators;
+    });
+
     passed &= run("a select keeps the bits common to both arms", [] {
         Builder b;
         auto& condition = b.Emit(IrOpcode::ULessThan32, IrType::Bool, {&b.Unknown(), &b.Constant(16u)});

@@ -37,6 +37,52 @@ template <typename TFunction> bool foldU32(IrBuilder& builder, IrValue& inst, TF
     return true;
 }
 
+bool foldUMinMaxIdentity(IrValue& inst) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    if (&lhs == &rhs) {
+        replaceWith(inst, lhs);
+        return true;
+    }
+    const bool minimum = inst.Opcode() == IrOpcode::UMin32;
+    const auto foldBoundary = [&](IrValue& constant, IrValue& other) {
+        if (!isImmediate(constant, IrType::U32)) return false;
+        const auto immediate = constant.ImmediateU32();
+        if ((minimum && immediate == 0u) || (!minimum && immediate == UINT32_MAX)) {
+            replaceWith(inst, constant);
+        } else if ((minimum && immediate == UINT32_MAX) || (!minimum && immediate == 0u)) {
+            replaceWith(inst, other);
+        } else {
+            return false;
+        }
+        return true;
+    };
+    return foldBoundary(lhs, rhs) || foldBoundary(rhs, lhs);
+}
+
+bool foldSMinMaxIdentity(IrValue& inst) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    if (&lhs == &rhs) {
+        replaceWith(inst, lhs);
+        return true;
+    }
+    const bool minimum = inst.Opcode() == IrOpcode::SMin32;
+    const auto foldBoundary = [&](IrValue& constant, IrValue& other) {
+        if (!isImmediate(constant, IrType::U32)) return false;
+        const auto immediate = constant.ImmediateU32();
+        if ((minimum && immediate == 0x80000000u) || (!minimum && immediate == 0x7fffffffu)) {
+            replaceWith(inst, constant);
+        } else if ((minimum && immediate == 0x7fffffffu) || (!minimum && immediate == 0x80000000u)) {
+            replaceWith(inst, other);
+        } else {
+            return false;
+        }
+        return true;
+    };
+    return foldBoundary(lhs, rhs) || foldBoundary(rhs, lhs);
+}
+
 template <typename TFunction> bool foldU64(IrBuilder& builder, IrValue& inst, TFunction function) {
     auto& lhs = resolveArg(inst, 0);
     auto& rhs = resolveArg(inst, 1);
@@ -664,6 +710,36 @@ bool replaceBinaryIdentity(IrValue& inst, IrType type, std::uint64_t identity) {
     return false;
 }
 
+bool replaceBinaryAnnihilator(IrValue& inst, IrType type, std::uint64_t annihilator) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    if (isImmediate(lhs, type) && (type == IrType::U32 ? lhs.ImmediateU32() == static_cast<std::uint32_t>(annihilator) : lhs.ImmediateU64() == annihilator)) {
+        replaceWith(inst, lhs);
+        return true;
+    }
+    if (isImmediate(rhs, type) && (type == IrType::U32 ? rhs.ImmediateU32() == static_cast<std::uint32_t>(annihilator) : rhs.ImmediateU64() == annihilator)) {
+        replaceWith(inst, rhs);
+        return true;
+    }
+    return false;
+}
+
+bool replaceBinarySelf(IrBuilder& builder, IrValue& inst, IrType type, std::uint64_t selfConstant) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    if (&lhs != &rhs) return false;
+    replaceWith(inst, type == IrType::U32 ? builder.Constant(static_cast<std::uint32_t>(selfConstant)) : builder.ConstantU64(selfConstant));
+    return true;
+}
+
+bool replaceBinaryIdempotent(IrValue& inst) {
+    auto& lhs = resolveArg(inst, 0);
+    auto& rhs = resolveArg(inst, 1);
+    if (&lhs != &rhs) return false;
+    replaceWith(inst, lhs);
+    return true;
+}
+
 bool foldSelect(IrValue& inst) {
     auto& condition = resolveArg(inst, 0);
     if (isImmediate(condition, IrType::U1)) {
@@ -1024,6 +1100,7 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a - b; })) {
                 return true;
             }
+            if (replaceBinarySelf(builder, value, IrType::U32, 0u)) return true;
             auto& rhs = resolveArg(value, 1);
             if (isImmediate(rhs, IrType::U32) && rhs.ImmediateU32() == 0u) {
                 replaceWith(value, resolveArg(value, 0));
@@ -1035,6 +1112,7 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             if (foldU64(builder, value, [](std::uint64_t a, std::uint64_t b) { return a - b; })) {
                 return true;
             }
+            if (replaceBinarySelf(builder, value, IrType::U64, 0ull)) return true;
             auto& rhs = resolveArg(value, 1);
             if (isImmediate(rhs, IrType::U64) && rhs.ImmediateU64() == 0u) {
                 replaceWith(value, resolveArg(value, 0));
@@ -1046,12 +1124,14 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a * b; })) {
                 return true;
             }
+            if (replaceBinaryAnnihilator(value, IrType::U32, 0u)) return true;
             return replaceBinaryIdentity(value, IrType::U32, 1u);
         }
         case IrOpcode::IMul64: {
             if (foldU64(builder, value, [](std::uint64_t a, std::uint64_t b) { return a * b; })) {
                 return true;
             }
+            if (replaceBinaryAnnihilator(value, IrType::U64, 0ull)) return true;
             return replaceBinaryIdentity(value, IrType::U64, 1u);
         }
         case IrOpcode::WqmU64: {
@@ -1169,6 +1249,8 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a & b; })) {
                 return true;
             }
+            if (replaceBinaryIdempotent(value)) return true;
+            if (replaceBinaryAnnihilator(value, IrType::U32, 0u)) return true;
             if (replaceBinaryIdentity(value, IrType::U32, 0xffffffffu)) return true;
             if (foldRedundantMask(value)) return true;
             bool changed = false;
@@ -1182,16 +1264,25 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             if (foldU64(builder, value, [](std::uint64_t a, std::uint64_t b) { return a & b; })) {
                 return true;
             }
+            if (replaceBinaryIdempotent(value)) return true;
+            if (replaceBinaryAnnihilator(value, IrType::U64, 0ull)) return true;
             return replaceBinaryIdentity(value, IrType::U64, UINT64_MAX);
         }
-        case IrOpcode::BitwiseOr32:
-        case IrOpcode::BitwiseXor32: {
-            const auto opcode = value.Opcode();
-            if (foldU32(builder, value, [opcode](std::uint32_t a, std::uint32_t b) { return opcode == IrOpcode::BitwiseOr32 ? a | b : a ^ b; })) {
+        case IrOpcode::BitwiseOr32: {
+            if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a | b; })) {
                 return true;
             }
+            if (replaceBinaryIdempotent(value)) return true;
+            if (replaceBinaryAnnihilator(value, IrType::U32, 0xffffffffu)) return true;
             if (replaceBinaryIdentity(value, IrType::U32, 0u)) return true;
-            return opcode == IrOpcode::BitwiseOr32 && mergeMaskedParts(program, value);
+            return mergeMaskedParts(program, value);
+        }
+        case IrOpcode::BitwiseXor32: {
+            if (foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return a ^ b; })) {
+                return true;
+            }
+            if (replaceBinarySelf(builder, value, IrType::U32, 0u)) return true;
+            return replaceBinaryIdentity(value, IrType::U32, 0u);
         }
         case IrOpcode::BitwiseNot32: {
             auto& operand = resolveArg(value, 0);
@@ -1241,13 +1332,13 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
                 const auto lhs = std::bit_cast<std::int32_t>(a);
                 const auto rhs = std::bit_cast<std::int32_t>(b);
                 return opcode == IrOpcode::SMin32 ? (lhs < rhs ? a : b) : (lhs > rhs ? a : b);
-            });
+            }) || foldSMinMaxIdentity(value);
         }
         case IrOpcode::UMin32: {
-            return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::min(a, b); });
+            return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::min(a, b); }) || foldUMinMaxIdentity(value);
         }
         case IrOpcode::UMax32: {
-            return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::max(a, b); });
+            return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::max(a, b); }) || foldUMinMaxIdentity(value);
         }
         case IrOpcode::IEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a == b; }) || foldEqualityByValueSet(builder, value, true, facts);
         case IrOpcode::INotEqual32: return foldConstantBitTest(builder, value) || foldStartingLaneBitTest(program, builder, value) || foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a != b; }) || foldEqualityByValueSet(builder, value, false, facts);
