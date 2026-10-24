@@ -267,6 +267,20 @@ void stubsOperandsAtRspWithTheInstructionsBeforeThem() {
     require(sites[2].Body == stubBody({0x48, 0x89, 0x7c, 0x24, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x10}), "the store before the operand and the operand at rsp were not both moved by the shift");
 }
 
+void stubsShortOperandsAtRspWithTrailingNearBranch() {
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, LoadAtRsp);
+    append(body, {0x0f, 0x82, 0x04, 0x00, 0x00, 0x00});
+    append(body, {0x90, 0x90, 0x90, 0x90});
+    const auto input = image({framelessLeaf(FramelessPrologue, body, FramelessExit)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.OperandStubs == 1 && report.StubbedOperands == 1 && sites.size() == 3, "a leaf whose 4-byte operand at rsp sits before a near branch was not framed with a stub over that branch");
+    require(sites[2].Length == LoadAtRsp.size() + 6, "the stub site does not cover the 4-byte load and the 6-byte near branch");
+    require(sites[2].Relocations.size() == 1, "the stub site did not record a relocation for the absorbed branch");
+}
+
 void skipsLeavesWithOperandsThatCannotMove() {
     std::vector<std::uint8_t> evex = StoreBelowRsp;
     append(evex, EvexStoreBelowRsp);
@@ -606,6 +620,7 @@ int main() {
         stubsVexOperandsAtRsp();
         stubsOperandsAtRspWithTheInstructionsBeforeThem();
         stubsShortOperandsAtRspBeforeABranchWithTheInstructionsBeforeThem();
+        stubsShortOperandsAtRspWithTrailingNearBranch();
         skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget();
         skipsLeavesWithOperandsThatCannotMove();
         skipsLeavesThatCopyRsp();
