@@ -8271,6 +8271,43 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     MarkDccUncompressed(context, color.dccAddress, surfaceBytes);
     Require(memoryHolds({0x10, 0x20, 0x40, 0x80}), "the clear recorded behind a pending key store did not store CB_COLOR_CLEAR_WORD");
     Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the keys after a clear behind a pending key store are not uncompressed");
+    {
+        ClearCachedTextures(context.device);
+        std::memset(texels, 0x55, surfaceBytes);
+        std::memset(keys, 0xc0, keyCount);
+        const auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+        Require(resident != nullptr && resident->UploadedKeys() == DccKeys::Clear1111, "the resident image was not uploaded from DCC clear keys");
+        const std::size_t halfBytes = surfaceBytes / 2;
+        Buffer staging(context, halfBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(staging.Bytes().data(), 0x22, halfBytes);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {side, side / 2, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging.Handle(), resident->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        resident->MarkDirty();
+        Require(StorageTexture::FindPending(address, surfaceBytes) == resident, "resident image is not pending after partial draw");
+        RunColorMetadataPass(context, pass);
+        Require(keysUncompressed(), "the fast clear eliminate over pending resident left keys compressed");
+        const auto memoryHoldsPartial = [&] {
+            StorageTexture::FlushPending(address, surfaceBytes, nullptr, "test");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            std::vector<std::uint8_t> stored(surfaceBytes);
+            AgcDriver::GuestMemory::Read(address, std::as_writable_bytes(std::span(stored)), 1);
+            for (std::size_t i = 0; i < halfBytes; ++i) {
+                if (stored[i] != 0x22) return false;
+            }
+            for (std::size_t i = halfBytes; i < surfaceBytes; ++i) {
+                if (stored[i] != 0xff) return false;
+            }
+            return true;
+        };
+        Require(memoryHoldsPartial(), "the fast clear eliminate over partially written resident overwrote drawn texels or corrupted untouched clear blocks");
+    }
 }
 
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
