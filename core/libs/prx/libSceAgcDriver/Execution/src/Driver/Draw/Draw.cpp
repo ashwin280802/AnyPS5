@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
@@ -95,7 +96,7 @@ void noteFinisherHandOff(bool handed) {
     if (!stats) return;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    std::fprintf(stderr, "[finisher] draws (10 s): %llu handed to the draw finisher, %llu finished on the worker%s\n", static_cast<unsigned long long>(handedOff.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), DrawFinisher::DrainText().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[finisher] draws (10 s): %llu handed to the draw finisher, %llu finished on the worker%s\n", static_cast<unsigned long long>(handedOff.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), DrawFinisher::DrainText().c_str());
 }
 
 }
@@ -405,7 +406,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();
-    const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || arguments.firstVertexOrIndex < drawParameters.indexCount); };
+    const auto recordDraws = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !drawParameters.indirect->indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
     if (emptyIndirectSkip && drawParameters.indirect && !programs.empty()) {
         const auto known = cpuIndirectPrograms.find(programs.front().binary.codeAddress);
         if (known != cpuIndirectPrograms.end() && known->second) {
@@ -541,6 +542,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             ++drawRelocationTrials[drawIdentity].hits;
+            if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
+                const auto donor = drawCache.find(alias->second);
+                if (donor != drawCache.end() && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
+                    drawOrder.splice(drawOrder.begin(), drawOrder, donor->second->order);
+                    donor->second->touched = drawCacheHits;
+                    ++drawEntryCounters.touches;
+                }
+            }
         }
         if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
     }
@@ -944,7 +953,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto baseVertexWords = UserDataWords(programs, roles, indirect.baseVertexLocation);
         const auto startInstanceWords = UserDataWords(programs, roles, indirect.startInstanceLocation);
         const auto drawIndexWords = indirect.drawIndexEnabled ? UserDataWords(programs, roles, indirect.drawIndexLocation) : std::vector<std::pair<std::size_t, std::size_t>>{};
-        const auto drawable = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || arguments.firstVertexOrIndex < drawParameters.indexCount); };
+        const auto drawable = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || !indirect.indexLimitKnown || arguments.firstVertexOrIndex < drawParameters.indexCount); };
         std::size_t lastDrawable = records.size();
         for (std::size_t record = 0; record < records.size(); ++record) {
             if (drawable(records[record])) lastDrawable = record;
@@ -970,10 +979,16 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
             if (drawParameters.indexed) {
-
-                if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;
+                if (indirect.indexLimitKnown) {
+                    if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;
+                    direct.indexCount = std::min(arguments.count, drawParameters.indexCount - arguments.firstVertexOrIndex);
+                } else {
+                    const auto end = static_cast<std::uint64_t>(arguments.firstVertexOrIndex) + arguments.count;
+                    require(end <= std::numeric_limits<std::uint32_t>::max(), "indirect draw index range overflow");
+                    require(end * drawParameters.indexSize <= std::numeric_limits<std::uint64_t>::max() - drawParameters.indexAddress, "indirect draw index range address overflow");
+                    direct.indexCount = arguments.count;
+                }
                 direct.indexAddress = drawParameters.indexAddress + static_cast<std::uint64_t>(arguments.firstVertexOrIndex) * drawParameters.indexSize;
-                direct.indexCount = std::min(arguments.count, drawParameters.indexCount - arguments.firstVertexOrIndex);
                 direct.indexSize = drawParameters.indexSize;
             } else {
                 direct.firstVertex = indirect.indxOffset;
