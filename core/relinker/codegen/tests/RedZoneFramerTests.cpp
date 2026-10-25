@@ -309,6 +309,35 @@ void skipsShortOperandsAtRspWithBranchTargetInsideStub() {
     require(report.Skipped.at("rsp operand that cannot move and has no room for a stub") == 1, "a branch targeting the stub was not refused");
 }
 
+void framesLeafWithShortExitSite() {
+    const std::vector<std::uint8_t> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56};
+    std::vector<std::uint8_t> body = StoreBelowPushes;
+    append(body, {0xb8, 0x01, 0x00, 0x00, 0x00});
+    const std::vector<std::uint8_t> exit{0x41, 0x5e, 0x5d, 0xc3};
+    std::vector<std::uint8_t> func = prologue;
+    append(func, body);
+    append(func, exit);
+    const auto input = image({func});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Exits == 1, "a leaf with a 4-byte pop-ret exit preceded by sequential instructions was not framed");
+    require(sites.size() == 2, "a framed leaf with a short exit needs one prologue and one exit site");
+    require(sites[1].Length == 9, "the exit site did not absorb the 5-byte mov eax instruction before ret");
+}
+
+void framesLeafWithShortPrologue() {
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, {0xb8, 0x01, 0x00, 0x00, 0x00});
+    const auto input = image({framelessLeaf({0x41, 0x56, 0x41, 0x57}, body, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Exits == 1, "a leaf with a 4-byte prologue was not framed by forward expansion");
+    require(sites.size() == 2, "a framed leaf with a short prologue needs one prologue and one exit site");
+    require(sites[0].Length == 9, "the prologue site did not absorb the 5-byte store below rsp instruction");
+}
+
 void skipsLeavesWithOperandsThatCannotMove() {
     std::vector<std::uint8_t> evex = StoreBelowRsp;
     append(evex, EvexStoreBelowRsp);
@@ -317,7 +346,9 @@ void skipsLeavesWithOperandsThatCannotMove() {
     std::vector<std::uint8_t> beforeTarget = StoreBelowRsp;
     append(beforeTarget, LoadAtRsp);
     append(beforeTarget, {0xff, 0xc0, 0x3b, 0x44, 0x24, 0xf0, 0x72, 0xf8});
-    const auto input = image({framelessLeaf(FramelessPrologue, evex, FramelessExit), framelessLeaf(FramelessPrologue, beforeExit, FramelessExit), framelessLeaf(FramelessPrologue, beforeTarget, FramelessExit), framelessLeaf({0x41, 0x56, 0x41, 0x57}, StoreBelowRsp, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
+    std::vector<std::uint8_t> shortWithJump{0xeb, 0x00};
+    append(shortWithJump, StoreBelowRsp);
+    const auto input = image({framelessLeaf(FramelessPrologue, evex, FramelessExit), framelessLeaf(FramelessPrologue, beforeExit, FramelessExit), framelessLeaf(FramelessPrologue, beforeTarget, FramelessExit), framelessLeaf({0x41, 0x56, 0x41, 0x57}, shortWithJump, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
@@ -628,6 +659,47 @@ void leavesCodeWithoutAFunctionRange() {
     require(sites.empty() && report.Functions == 0, "code without a function range was framed");
 }
 
+void framesLeafWithRipRelativeExitSite() {
+    const std::vector<std::uint8_t> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56};
+    std::vector<std::uint8_t> body = StoreBelowPushes;
+    append(body, {0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00});
+    const std::vector<std::uint8_t> exit{0x41, 0x5e, 0x5d, 0xc3};
+    std::vector<std::uint8_t> func = prologue;
+    append(func, body);
+    append(func, exit);
+    const auto input = image({func});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Exits == 1, "a leaf with a 4-byte pop-ret exit preceded by a RIP-relative instruction was not framed");
+    require(sites.size() == 2, "a framed leaf with a short exit needs one prologue and one exit site");
+    require(sites[1].Relocations.size() == 1, "the exit site did not record a relocation for the absorbed RIP-relative instruction");
+}
+
+void framesLeafWithRipRelativePrologue() {
+    std::vector<std::uint8_t> body{0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00};
+    append(body, StoreBelowRsp);
+    const auto input = image({framelessLeaf({0x41, 0x56, 0x41, 0x57}, body, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Exits == 1, "a leaf with a 4-byte prologue followed by a RIP-relative instruction was not framed");
+    require(sites.size() == 2, "a framed leaf with a short prologue needs one prologue and one exit site");
+    require(sites[0].Relocations.size() == 1, "the prologue site did not record a relocation for the absorbed RIP-relative instruction");
+}
+
+void framesLeafWithConditionalBranchPrologue() {
+    std::vector<std::uint8_t> body{0x0f, 0x84, 0x05, 0x00, 0x00, 0x00};
+    append(body, StoreBelowRsp);
+    const auto input = image({framelessLeaf({0x41, 0x56, 0x41, 0x57}, body, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Exits == 1, "a leaf with a 4-byte prologue followed by a near conditional branch was not framed");
+    require(sites.size() == 2, "a framed leaf with a short prologue needs one prologue and one exit site");
+    require(sites[0].Relocations.size() == 1, "the prologue site did not record a relocation for the absorbed branch");
+}
+
 }
 
 int main() {
@@ -651,6 +723,11 @@ int main() {
         stubsShortOperandsAtRspWithTrailingNearBranch();
         stubsShortOperandsAtRspWithTrailingNearJump();
         skipsShortOperandsAtRspWithBranchTargetInsideStub();
+        framesLeafWithShortExitSite();
+        framesLeafWithShortPrologue();
+        framesLeafWithRipRelativeExitSite();
+        framesLeafWithRipRelativePrologue();
+        framesLeafWithConditionalBranchPrologue();
         skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget();
         skipsLeavesWithOperandsThatCannotMove();
         skipsLeavesThatCopyRsp();

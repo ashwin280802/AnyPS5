@@ -287,7 +287,15 @@ void frameSegment(
         bool leaf = true;
         bool redZone = false;
         const char* reason = nullptr;
-        std::vector<std::pair<std::size_t, std::size_t>> exits;
+        struct ExitSite {
+            std::size_t Begin;
+            std::size_t PopsStart;
+            std::size_t End;
+            std::vector<std::uint8_t> Prefix;
+            std::vector<std::size_t> Absorbed;
+            std::vector<StubRelocation> Relocations;
+        };
+        std::vector<ExitSite> exits;
         std::map<std::size_t, std::pair<std::size_t, std::vector<std::uint8_t>>> moves;
         std::vector<std::size_t> stubbed;
         const auto functionEnd = limit;
@@ -338,22 +346,111 @@ void frameSegment(
                 }
                 const auto siteStart = body[q].Offset;
                 const auto siteEnd = insn.Offset + 1;
-                if (siteEnd - siteStart < kJumpBytes) { reason = "exit shorter than a jump"; continue; }
-                if (targetInside(siteStart, siteEnd)) { reason = "branch into an exit"; continue; }
-                exits.emplace_back(siteStart, siteEnd);
+                auto exitStart = siteStart;
+                auto exitFirst = q;
+                std::vector<std::uint8_t> prefix;
+                std::vector<std::size_t> absorbed;
+                while (siteEnd - exitStart < kJumpBytes && exitFirst > p) {
+                    const auto j = exitFirst - 1;
+                    const auto& prior = body[j];
+                    if (prior.Offset + prior.Length != exitStart || prior.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(j)) break;
+                    if (targetInside(prior.Offset, siteEnd)) break;
+                    if (prior.Info.HasRipRelativeDisp) {
+                        if (prior.Info.RipRelativeDispOffset + 4 > prior.Length) break;
+                        prefix.insert(prefix.begin(), at(j), at(j) + prior.Length);
+                        exitStart = prior.Offset;
+                        exitFirst = j;
+                        absorbed.push_back(j);
+                        continue;
+                    }
+                    const auto use = memoryUse(at(j), prior);
+                    const auto bytes = use.RspBased ? withDisplacement(at(j), prior, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(j), at(j) + prior.Length);
+                    if (!bytes) break;
+                    prefix.insert(prefix.begin(), bytes->begin(), bytes->end());
+                    exitStart = prior.Offset;
+                    exitFirst = j;
+                    absorbed.push_back(j);
+                }
+                if (siteEnd - exitStart < kJumpBytes) { reason = "exit shorter than a jump"; continue; }
+                if (targetInside(exitStart, siteEnd)) { reason = "branch into an exit"; continue; }
+                std::vector<StubRelocation> exitRelocs;
+                std::size_t offsetInPrefix = 0;
+                for (std::size_t j = exitFirst; j < q; ++j) {
+                    const auto& insn = body[j];
+                    if (insn.Info.HasRipRelativeDisp) {
+                        std::int32_t origDisp = 0;
+                        std::memcpy(&origDisp, at(j) + insn.Info.RipRelativeDispOffset, 4);
+                        StubRelocation reloc;
+                        reloc.DisplacementOffset = offsetInPrefix + insn.Info.RipRelativeDispOffset;
+                        reloc.InstructionEnd = offsetInPrefix + insn.Length;
+                        reloc.SiteTarget = static_cast<std::int64_t>(insn.Offset - exitStart + insn.Length) + origDisp;
+                        exitRelocs.push_back(reloc);
+                    }
+                    offsetInPrefix += insn.Length;
+                }
+                exits.push_back({exitStart, siteStart, siteEnd, std::move(prefix), std::move(absorbed), std::move(exitRelocs)});
             }
         }
         if (!leaf || !redZone) continue;
         ++report.RedZoneFunctions;
-        const auto prologueEnd = p > 0 ? body[p - 1].Offset + body[p - 1].Length : start;
-        if (reason == nullptr && ((pushed.empty() && allocation == 0) || prologueEnd - start < kJumpBytes)) reason = "prologue shorter than a jump";
-        if (reason == nullptr && targetInside(start, prologueEnd)) reason = "branch into the prologue";
+        auto entryEnd = p > 0 ? body[p - 1].Offset + body[p - 1].Length : start;
+        auto entryLast = p;
+        std::vector<std::uint8_t> entrySuffix;
+        std::vector<std::size_t> absorbedEntry;
+        std::vector<StubRelocation> entryRelocs;
+        const auto lowerSize = lowerRsp(shift).size();
+        const auto minExitBegin = exits.empty() ? functionEnd : std::min_element(exits.begin(), exits.end(), [](const auto& a, const auto& b) { return a.Begin < b.Begin; })->Begin;
+        while (entryEnd - start < kJumpBytes && entryLast < body.size()) {
+            const auto& next = body[entryLast];
+            if (next.Offset != entryEnd || next.Offset + next.Length > minExitBegin || frees.contains(entryLast)) break;
+            if (next.Info.HasBranchTarget && next.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
+                const auto target = static_cast<std::int64_t>(next.Offset + next.Length) + next.Info.BranchDisp;
+                if (target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(next.Offset + next.Length)) break;
+                const auto* b = at(entryLast);
+                if (next.Length == 6 && b[0] == 0x0f && (b[1] & 0xf0) == 0x80) {
+                    const auto dispOffset = lowerSize + entrySuffix.size() + 2;
+                    entrySuffix.insert(entrySuffix.end(), b, b + 6);
+                    entryRelocs.push_back({dispOffset, lowerSize + entrySuffix.size(), target - static_cast<std::int64_t>(start)});
+                    entryEnd = next.Offset + next.Length;
+                    absorbedEntry.push_back(entryLast);
+                    ++entryLast;
+                    break;
+                }
+                break;
+            }
+            if (next.Info.FlowKind != ControlFlowKind::Sequential) break;
+            if (targetInside(start, next.Offset + next.Length)) break;
+            if (next.Info.HasRipRelativeDisp) {
+                if (next.Info.RipRelativeDispOffset + 4 > next.Length) break;
+                std::int32_t origDisp = 0;
+                std::memcpy(&origDisp, at(entryLast) + next.Info.RipRelativeDispOffset, 4);
+                StubRelocation reloc;
+                reloc.DisplacementOffset = lowerSize + entrySuffix.size() + next.Info.RipRelativeDispOffset;
+                reloc.InstructionEnd = lowerSize + entrySuffix.size() + next.Length;
+                reloc.SiteTarget = static_cast<std::int64_t>(next.Offset - start + next.Length) + origDisp;
+                entryRelocs.push_back(reloc);
+                entrySuffix.insert(entrySuffix.end(), at(entryLast), at(entryLast) + next.Length);
+                entryEnd = next.Offset + next.Length;
+                absorbedEntry.push_back(entryLast);
+                ++entryLast;
+                continue;
+            }
+            const auto use = memoryUse(at(entryLast), next);
+            const auto bytes = use.RspBased ? withDisplacement(at(entryLast), next, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(entryLast), at(entryLast) + next.Length);
+            if (!bytes) break;
+            entrySuffix.insert(entrySuffix.end(), bytes->begin(), bytes->end());
+            entryEnd = next.Offset + next.Length;
+            absorbedEntry.push_back(entryLast);
+            ++entryLast;
+        }
+        if (reason == nullptr && entryEnd - start < kJumpBytes) reason = "prologue shorter than a jump";
+        if (reason == nullptr && targetInside(start, entryEnd)) reason = "branch into the prologue";
         if (reason == nullptr && exits.empty()) reason = "no ret exit";
-        if (reason == nullptr && (overlapsExisting(start, prologueEnd) || std::any_of(exits.begin(), exits.end(), [&](const auto& exit) { return overlapsExisting(exit.first, exit.second); }))) reason = "overlaps another stub";
+        if (reason == nullptr && (overlapsExisting(start, entryEnd) || std::any_of(exits.begin(), exits.end(), [&](const auto& exit) { return overlapsExisting(exit.Begin, exit.End); }))) reason = "overlaps another stub";
         std::vector<OperandStub> stubs;
         const auto overlapsSite = [&](const std::size_t begin, const std::size_t end) {
-            if (begin < prologueEnd && start < end) return true;
-            if (std::any_of(exits.begin(), exits.end(), [&](const auto& exit) { return begin < exit.second && exit.first < end; })) return true;
+            if (begin < entryEnd && start < end) return true;
+            if (std::any_of(exits.begin(), exits.end(), [&](const auto& exit) { return begin < exit.End && exit.Begin < end; })) return true;
             return std::any_of(stubs.begin(), stubs.end(), [&](const OperandStub& stub) { return begin < stub.End && stub.Begin < end; });
         };
         for (const auto k : stubbed) {
@@ -396,7 +493,7 @@ void frameSegment(
                 }
                 break;
             }
-            while (stub.End - stub.Begin < kJumpBytes && stub.First > p) {
+            while (stub.End - stub.Begin < kJumpBytes && stub.First > entryLast) {
                 const auto j = stub.First - 1;
                 const auto& prior = body[j];
                 if (prior.Offset + prior.Length != stub.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || prior.Info.HasRipRelativeDisp || frees.contains(j)) break;
@@ -414,6 +511,9 @@ void frameSegment(
         if (reason != nullptr) { skip(reason); continue; }
         for (const auto& stub : stubs)
             for (auto k = stub.First; k < stub.Last; ++k) moves.erase(k);
+        for (const auto& exit : exits)
+            for (const auto j : exit.Absorbed) moves.erase(j);
+        for (const auto j : absorbedEntry) moves.erase(j);
 
         const auto addSite = [&](const std::size_t begin, const std::size_t end, std::vector<std::uint8_t> code, std::vector<StubRelocation> relocations = {}) {
             TrampolineSite site;
@@ -429,15 +529,18 @@ void frameSegment(
             sites.push_back(std::move(site));
         };
         const auto original = [&](const std::size_t begin, const std::size_t end) { return std::vector<std::uint8_t>(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end)); };
-        auto entry = original(start, prologueEnd);
+        auto entry = original(start, p > 0 ? body[p - 1].Offset + body[p - 1].Length : start);
         const auto lower = lowerRsp(shift);
         entry.insert(entry.end(), lower.begin(), lower.end());
-        addSite(start, prologueEnd, std::move(entry));
+        entry.insert(entry.end(), entrySuffix.begin(), entrySuffix.end());
+        addSite(start, entryEnd, std::move(entry), std::move(entryRelocs));
         for (const auto& exit : exits) {
-            auto code = raiseRsp(shift);
-            const auto tail = original(exit.first, exit.second);
+            auto code = exit.Prefix;
+            const auto raise = raiseRsp(shift);
+            code.insert(code.end(), raise.begin(), raise.end());
+            const auto tail = original(exit.PopsStart, exit.End);
             code.insert(code.end(), tail.begin(), tail.end());
-            addSite(exit.first, exit.second, std::move(code));
+            addSite(exit.Begin, exit.End, std::move(code), std::move(exit.Relocations));
         }
         for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body), std::move(stub.Relocations));
         for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
