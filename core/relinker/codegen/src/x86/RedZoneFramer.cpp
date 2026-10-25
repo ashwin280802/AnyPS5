@@ -206,6 +206,7 @@ struct OperandStub {
     std::size_t End;
     std::vector<std::uint8_t> Body;
     std::size_t Operands = 0;
+    std::vector<StubRelocation> Relocations;
 };
 
 void frameSegment(
@@ -361,14 +362,39 @@ void frameSegment(
             OperandStub stub{k, k, body[k].Offset, body[k].Offset, {}};
             while (stub.Last < body.size() && stub.End - stub.Begin < kJumpBytes) {
                 const auto& covered = body[stub.Last];
-                if (covered.Offset != stub.End || covered.Info.FlowKind != ControlFlowKind::Sequential || covered.Info.HasRipRelativeDisp || frees.contains(stub.Last)) break;
-                const auto use = memoryUse(at(stub.Last), covered);
-                const auto bytes = use.RspBased ? withDisplacement(at(stub.Last), covered, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(stub.Last), at(stub.Last) + covered.Length);
-                if (!bytes) break;
-                stub.Body.insert(stub.Body.end(), bytes->begin(), bytes->end());
-                if (use.RspBased) ++stub.Operands;
-                stub.End += covered.Length;
-                ++stub.Last;
+                if (covered.Offset != stub.End || frees.contains(stub.Last) || covered.Info.HasRipRelativeDisp) break;
+                if (covered.Info.FlowKind == ControlFlowKind::Sequential) {
+                    const auto use = memoryUse(at(stub.Last), covered);
+                    const auto bytes = use.RspBased ? withDisplacement(at(stub.Last), covered, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(stub.Last), at(stub.Last) + covered.Length);
+                    if (!bytes) break;
+                    stub.Body.insert(stub.Body.end(), bytes->begin(), bytes->end());
+                    if (use.RspBased) ++stub.Operands;
+                    stub.End += covered.Length;
+                    ++stub.Last;
+                    continue;
+                }
+                if (covered.Info.HasBranchTarget && (covered.Info.FlowKind == ControlFlowKind::ConditionalBranch || covered.Info.FlowKind == ControlFlowKind::UnconditionalJump)) {
+                    const auto target = static_cast<std::int64_t>(covered.Offset + covered.Length) + covered.Info.BranchDisp;
+                    if (target >= static_cast<std::int64_t>(stub.Begin) && target < static_cast<std::int64_t>(stub.End + covered.Length)) break;
+                    const auto* b = at(stub.Last);
+                    if (covered.Length == 6 && b[0] == 0x0f && (b[1] & 0xf0) == 0x80) {
+                        const auto dispOffset = stub.Body.size() + 2;
+                        stub.Body.insert(stub.Body.end(), b, b + 6);
+                        stub.Relocations.push_back({dispOffset, stub.Body.size(), target - static_cast<std::int64_t>(stub.Begin)});
+                        stub.End += covered.Length;
+                        ++stub.Last;
+                        break;
+                    }
+                    if (covered.Length == 5 && b[0] == 0xe9) {
+                        const auto dispOffset = stub.Body.size() + 1;
+                        stub.Body.insert(stub.Body.end(), b, b + 5);
+                        stub.Relocations.push_back({dispOffset, stub.Body.size(), target - static_cast<std::int64_t>(stub.Begin)});
+                        stub.End += covered.Length;
+                        ++stub.Last;
+                        break;
+                    }
+                }
+                break;
             }
             while (stub.End - stub.Begin < kJumpBytes && stub.First > p) {
                 const auto j = stub.First - 1;
@@ -389,7 +415,7 @@ void frameSegment(
         for (const auto& stub : stubs)
             for (auto k = stub.First; k < stub.Last; ++k) moves.erase(k);
 
-        const auto addSite = [&](const std::size_t begin, const std::size_t end, std::vector<std::uint8_t> code) {
+        const auto addSite = [&](const std::size_t begin, const std::size_t end, std::vector<std::uint8_t> code, std::vector<StubRelocation> relocations = {}) {
             TrampolineSite site;
             site.Offset = ph.Offset + begin;
             site.Address = ph.MappedAddress + begin;
@@ -398,6 +424,7 @@ void frameSegment(
             site.ReturnBranchOffset = code.size();
             code.insert(code.end(), std::begin(kJumpBack), std::end(kJumpBack));
             site.Body = std::move(code);
+            site.Relocations = std::move(relocations);
             taken.emplace_back(begin, end);
             sites.push_back(std::move(site));
         };
@@ -412,7 +439,7 @@ void frameSegment(
             code.insert(code.end(), tail.begin(), tail.end());
             addSite(exit.first, exit.second, std::move(code));
         }
-        for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
+        for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body), std::move(stub.Relocations));
         for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
         ++report.Framed;
         if (!rbpPrologue) ++report.FramedWithoutFramePointer;
