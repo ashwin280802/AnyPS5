@@ -633,6 +633,22 @@ void testLargeDataFill() {
     GuestHeap::GuestHeapFree_nid_postfix(produced);
 }
 
+std::array<std::uint32_t, 7> dataToGds(const void* source, std::uint32_t gdsOffset, std::uint32_t bytes) {
+    const auto from = reinterpret_cast<std::uintptr_t>(source);
+    constexpr std::uint32_t cachePolicies = (1u << 13u) | (2u << 25u);
+    return {0xc0055000, 0x60100000 | cachePolicies, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(static_cast<std::uint64_t>(from) >> 32u), gdsOffset, 0, bytes};
+}
+
+void testDmaDataToGdsDoesNotDrain() {
+    alignas(64) static volatile std::uint32_t filled = 0;
+    std::array<std::uint32_t, 4> source{1, 2, 3, 4};
+    const auto drainsBefore = AgcDriver::DriverDetail::storesDrained.load();
+    submit(0, commands(dataToGds(source.data(), 0x100, 16), writeData(&filled, 1)));
+    waitFor(&filled, 1, "the label after a DMA_DATA to GDS never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(AgcDriver::DriverDetail::storesDrained.load() == drainsBefore, "a DMA_DATA packet to GDS drained the device");
+}
+
 void testCopyIntoHostMemory() {
     constexpr std::size_t words = 32768;
     constexpr auto bytes = static_cast<std::uint32_t>(words * 4);
@@ -1116,6 +1132,7 @@ int main(int argc, char** argv) {
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
         testLargeDataFill();
+        testDmaDataToGdsDoesNotDrain();
         testSmallCopyBehindPendingSource();
         testRegisteredFloatMode();
         testDispatchFloatMode();

@@ -205,6 +205,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 }
             }
         }
+        if (drained && opcode == 0x50 && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds) {
+            orderedAlready = true;
+            drained = false;
+        }
         if (drained) ++storesDrained;
     }
 
